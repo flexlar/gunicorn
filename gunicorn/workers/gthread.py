@@ -12,6 +12,7 @@
 
 from concurrent import futures
 import errno
+import faulthandler
 import os
 import selectors
 import socket
@@ -40,15 +41,12 @@ class TConn:
 
         self.timeout = None
         self.parser = None
-        self.initialized = False
 
         # set the socket to non blocking
         self.sock.setblocking(False)
 
     def init(self):
-        self.initialized = True
         self.sock.setblocking(True)
-
         if self.parser is None:
             # wrap the socket if needed
             if self.cfg.is_ssl:
@@ -74,6 +72,7 @@ class ThreadWorker(base.Worker):
         # initialise the pool
         self.tpool = None
         self.poller = None
+        self.shutdown_event = os.eventfd(0)
         self._lock = None
         self.futures = deque()
         self._keep = deque()
@@ -97,6 +96,10 @@ class ThreadWorker(base.Worker):
         """Override this method to customize how the thread pool is created"""
         return futures.ThreadPoolExecutor(max_workers=self.cfg.threads)
 
+    def handle_exit(self, sig, frame):
+        self.alive = False
+        os.eventfd_write(self.shutdown_event, 1)
+
     def handle_quit(self, sig, frame):
         self.alive = False
         # worker_int callback
@@ -107,6 +110,7 @@ class ThreadWorker(base.Worker):
 
     def _wrap_future(self, fs, conn):
         fs.conn = conn
+        fs._request_timeout = time.monotonic() + self.cfg.timeout
         self.futures.append(fs)
         fs.add_done_callback(self.finish_request)
 
@@ -123,30 +127,30 @@ class ThreadWorker(base.Worker):
             conn = TConn(self.cfg, sock, client, server)
 
             self.nr_conns += 1
-            # wait until socket is readable
-            with self._lock:
-                self.poller.register(conn.sock, selectors.EVENT_READ,
-                                     partial(self.on_client_socket_readable, conn))
+            # enqueue the job
+            self.enqueue_req(conn)
         except OSError as e:
             if e.errno not in (errno.EAGAIN, errno.ECONNABORTED,
                                errno.EWOULDBLOCK):
                 raise
 
-    def on_client_socket_readable(self, conn, client):
+    def reuse_connection(self, conn, client):
         with self._lock:
             # unregister the client from the poller
             self.poller.unregister(client)
-
-            if conn.initialized:
-                # remove the connection from keepalive
-                try:
-                    self._keep.remove(conn)
-                except ValueError:
-                    # race condition
-                    return
+            # remove the connection from keepalive
+            try:
+                self._keep.remove(conn)
+            except ValueError:
+                # race condition
+                return
 
         # submit the connection to a worker
         self.enqueue_req(conn)
+
+    def on_shutdown_event(self, *args):
+        # Drain any readable input to avoid getting polled again
+        _ = os.eventfd_read(self.shutdown_event)
 
     def murder_keepalived(self):
         now = time.time()
@@ -200,6 +204,9 @@ class ThreadWorker(base.Worker):
             acceptor = partial(self.accept, server)
             self.poller.register(sock, selectors.EVENT_READ, acceptor)
 
+        # This is just used to wake up the poller, nothing else needs to be done.
+        self.poller.register(self.shutdown_event, selectors.EVENT_READ, self.on_shutdown_event)
+
         while self.alive:
             # notify the arbiter we are alive
             self.notify()
@@ -207,7 +214,10 @@ class ThreadWorker(base.Worker):
             # can we accept more connections?
             if self.nr_conns < self.worker_connections:
                 # wait for an event
-                events = self.poller.select(1.0)
+                select_timeout = self.timeout or 1.0
+                if self._keep:
+                    select_timeout = min(select_timeout, self.cfg.keepalive)
+                events = self.poller.select(select_timeout)
                 for key, _ in events:
                     callback = key.data
                     callback(key.fileobj)
@@ -229,6 +239,15 @@ class ThreadWorker(base.Worker):
 
             # handle keepalive timeouts
             self.murder_keepalived()
+
+            # `gthread` does not implement ANY kind of request timeout, the
+            # simplest request timeout will kill the entire worker.
+            current_time = time.monotonic()
+            for fut in self.futures:
+                if current_time > fut._request_timeout:
+                    self.alive = False
+                    self.log.error("A request timed out. Exiting.")
+                    faulthandler.dump_traceback()
 
         self.tpool.shutdown(False)
         self.poller.close()
@@ -259,7 +278,7 @@ class ThreadWorker(base.Worker):
 
                     # add the socket to the event loop
                     self.poller.register(conn.sock, selectors.EVENT_READ,
-                                         partial(self.on_client_socket_readable, conn))
+                                         partial(self.reuse_connection, conn))
             else:
                 self.nr_conns -= 1
                 conn.close()
